@@ -1,4 +1,3 @@
-import root_numpy
 import pandas as pd
 import numpy as np
 import numpy.linalg as la
@@ -6,6 +5,8 @@ import numpy
 import copy
 import networkx as nx
 from tqdm import tqdm
+import uproot
+
 
 BT_Z_unique = np.array([     0.,   1293.,   2586.,   3879.,   5172.,   6465.,   7758.,
                           9051.,  10344.,  11637.,  12930.,  14223.,  15516.,  16809.,
@@ -28,40 +29,12 @@ DISTANCE = 1293.
 
 kwargs = {'bins': 100, 'alpha': 0.8, 'normed': True}
 
-
-def load_bg(filepath='./', step=1000):
-    # ignore 57th layer since it looks different
-    etalon_plates = []
-    for p in range(48, 57):
-        backtracks = root_numpy.root2array(filepath+"129294.{p}.1.1000.cp.root".format(p=p),
-                                           treename="couples",
-                                           branches=["s.eX", "s.eY", "s.eZ",
-                                                     "s.eTX", "s.eTY",
-                                                     "s.eChi2"], step=step)
-        etalon_plates.append(backtracks)
-    df = None
-    for p in range(58):
-        plate = numpy.copy(etalon_plates[p % len(etalon_plates)])
-        plate['s.eZ'] = p * DISTANCE
-        if df is None:
-            df = pd.DataFrame(plate)
-        else:
-            df = pd.concat([df, pd.DataFrame(plate)], ignore_index=True)
-    print("bg: {n} tracks".format(n=df.shape[0]))
-    return df
-
-
+import pandas as pd
 def load_mc(filename="mcdata_taue2.root", step=1):
-    mc = root_numpy.root2array(
-        filename,
-        treename="Data",
-        branches=["Event_id", "ele_P",
-                  "BT_X", "BT_Y", "BT_Z",
-                  "BT_SX", "BT_SY",
-                  "ele_x", "ele_y", "ele_z",
-                  "ele_sx", "ele_sy",
-                  "chisquare"],
-        step=step)
+    f = uproot.open(filename)
+    mc = f['Data'].pandas.df(["Event_id", "ele_P", "BT_X", "BT_Y",
+                              "BT_Z","BT_SX", "BT_SY","ele_x", 
+                              "ele_y", "ele_z", "ele_sx", "ele_sy", "chisquare", ], flatten=False)
     pmc = pd.DataFrame(mc)
     pmc['numtracks'] = pmc.BT_X.apply(lambda x: len(x))
     # cuts
@@ -90,103 +63,6 @@ def round_Z_coodr(x):
 
 round_Z_coodr = np.vectorize(round_Z_coodr)
 
-
-def combine_mc_bg(pmc, pbg, events=[0], bg_frac=0.1):
-    # first of all generate background with random permutation by Z-axis
-    bg_frac = bg_frac * (1 + np.random.uniform(-0.1, 0.1))
-    pbg_frac = pbg.sample(frac=bg_frac, replace=True).copy()
-    pbg_frac['s.eZ'] = numpy.random.choice(BT_Z_unique, size=len(pbg_frac))
-    pbg_frac['s.eX'] = np.random.uniform(low=BRICK_X_MIN, high=BRICK_X_MAX, size=len(pbg_frac))
-    pbg_frac['s.eY'] = np.random.uniform(low=BRICK_Y_MIN, high=BRICK_Y_MAX, size=len(pbg_frac))
-    
-    # random rotation of basetracks.
-    phi = np.random.uniform(0, 2 * np.pi, size=len(pbg_frac))
-    pbg_frac['s.eTX'] = np.cos(phi) * pbg_frac['s.eTX'] - np.sin(phi) * pbg_frac['s.eTY']
-    pbg_frac['s.eTY'] = np.sin(phi) * pbg_frac['s.eTX'] + np.cos(phi) * pbg_frac['s.eTY']
-    dmix = copy.deepcopy(pbg_frac[['s.eX', 's.eY', 's.eZ', 's.eTX', 's.eTY']])
-    dmix.columns = ['sx', 'sy', 'sz', 'TX', 'TY']
-    dmix['ex'] = pbg_frac['s.eX'] + pbg_frac['s.eTX'] * dZ
-    dmix['ey'] = pbg_frac['s.eY'] + pbg_frac['s.eTY'] * dZ
-    dmix['ez'] = pbg_frac['s.eZ'] + dZ
-    dmix['chi2'] = pbg_frac['s.eChi2']
-    dmix['signal'] = 0
-    dmix['ele_x'] = -999
-    dmix['ele_y'] = -999
-    dmix['ele_z'] = -999
-    dmix['ele_sx'] = -999
-    dmix['ele_sy'] = -999
-    dmix['ele_sz'] = -999
-
-    dd = dmix
-    # now we are generating signal uniformly in brick
-    N = 1
-    showers = []
-    dmcs = [dd]
-    for id in events:
-        index = pmc.loc[pmc.Event_id == id].index[0]
-        df = pmc.loc[index].copy()
-        # find length of shower
-        length = df['BT_Z'].max() - df['BT_Z'].min()
-
-        # unifrom generation of shower start
-        start_x = np.random.uniform(low=BRICK_X_MIN + SAFE_M, high=BRICK_X_MAX - SAFE_M)
-        start_y = np.random.uniform(low=BRICK_Y_MIN + SAFE_M, high=BRICK_Y_MAX - SAFE_M)
-        start_z = np.random.uniform(low=0., high=BT_Z_unique.max() - length - 1293.)
-
-        delta_x = start_x - df['ele_x']
-        BT_X = df['BT_X'] + delta_x
-        ele_x = df['ele_x'] + delta_x
-
-        delta_y = start_y - df['ele_y']
-        BT_Y = df['BT_Y'] + delta_y
-        ele_y = df['ele_y'] + delta_y
-
-        delta_z = start_z - df['ele_z']
-        BT_Z = df['BT_Z'] + delta_z
-        ele_z = df['ele_z'] + delta_z
-
-        BT_Z = round_Z_coodr(BT_Z)
-        ele_z = round_Z_coodr(ele_z).ravel()[0]
-
-        dmc = pd.DataFrame([
-            BT_X,
-            BT_Y,
-            BT_Z,
-            df['BT_SX'],
-            df['BT_SY'],
-            BT_X + df['BT_SX'] * dZ,
-            BT_Y + df['BT_SY'] * dZ,
-            BT_Z + dZ,
-            df['chisquare'][:len(df['BT_X'])]],
-            index=['sx', 'sy', 'sz', 'TX', 'TY',
-                   'ex', 'ey', 'ez', 'chi2']).T
-        dmc['signal'] = N
-        dmc['ele_x'] = ele_x
-        dmc['ele_y'] = ele_y
-        dmc['ele_z'] = ele_z
-        dmc['ele_sx'] = df['ele_sx']
-        dmc['ele_sy'] = df['ele_sy']
-        dmc['ele_sz'] = 1
-        showers.append(
-            {
-                'ele_x': ele_x,
-                'ele_y': ele_y,
-                'ele_z': ele_z,
-                'ele_sx': df['ele_sx'],
-                'ele_sy': df['ele_sy'],
-                'ele_P': df['ele_P'],
-                'numtracks': df['numtracks'],
-                'N': N
-            }
-        )
-        
-        N += 1
-        dmcs.append(dmc)
-        
-    dd = pd.concat(dmcs)
-
-    dd = dd.loc[dd.chi2 < 3.]
-    return dd, showers
 
 def angle(v1, v2):
     cos = (v1*v2).sum(axis=1)
